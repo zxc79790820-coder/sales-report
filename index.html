@@ -3261,6 +3261,8 @@ openDB().then(async()=>{
 // ── Auth ──
 
 // ── Auth ──
+// 舊裝置設定遷移：repo 已改名，殘留舊值會蓋過預設導致 404
+if(localStorage.getItem('gh_repo')==='sales-report')localStorage.setItem('gh_repo','sales-report-data');
 const SESSION_KEY = 'sr_session';
 let currentUser = null;
 
