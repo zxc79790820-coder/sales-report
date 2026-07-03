@@ -3290,6 +3290,45 @@ async function decryptToken(password){
   return new TextDecoder().decode(pt);
 }
 
+async function checkRunStatus(){
+  try{
+    const user=localStorage.getItem('gh_user')||'zxc79790820-coder';
+    const repo=localStorage.getItem('gh_repo')||'sales-report-data';
+    let msgs=[];
+    try{
+      const r=await fetch(`https://api.github.com/repos/${user}/${repo}/contents/run_status.json?ref=main&t=${Date.now()}`,{headers:ghHeaders()});
+      if(r.ok){
+        const st=await r.json();
+        if(st&&st.tasks){
+          const bad=st.tasks.filter(t=>!t.ok).map(t=>t.name);
+          if(bad.length) msgs.push('\u26a0 \u6700\u8fd1\u4e00\u6b21\u6392\u7a0b\u6709\u4efb\u52d9\u5931\u6557\uff1a'+bad.join('\u3001')+'\uff08'+(st.runAt||'').slice(0,16).replace('T',' ')+'\uff09');
+        }
+      }
+    }catch(e){}
+    try{
+      const cr=await fetch(`https://api.github.com/repos/${user}/${repo}/commits?path=data.json&per_page=1`,{headers:ghHeaders()});
+      if(cr.ok){
+        const cs=await cr.json();
+        const ageH=(Date.now()-new Date(cs[0].commit.committer.date).getTime())/3600000;
+        const dow=new Date().getDay();
+        const limit=(dow===0||dow===6||dow===1)?80:30;
+        if(ageH>limit) msgs.push('\u26a0 \u8cc7\u6599\u5df2 '+Math.round(ageH)+' \u5c0f\u6642\u672a\u66f4\u65b0\uff0c\u6392\u7a0b\u53ef\u80fd\u672a\u57f7\u884c');
+      }
+    }catch(e){}
+    if(msgs.length){
+      let bar=document.getElementById('run-status-bar');
+      if(!bar){
+        bar=document.createElement('div');
+        bar.id='run-status-bar';
+        bar.style.cssText='position:fixed;top:0;left:0;right:0;z-index:9999;background:#b45309;color:#fff;padding:8px 16px;font-size:13px;text-align:center;cursor:pointer;';
+        bar.onclick=()=>bar.remove();
+        document.body.appendChild(bar);
+      }
+      bar.textContent=msgs.join('\u3000|\u3000')+'\uff08\u9ede\u64ca\u95dc\u9589\uff09';
+    }
+  }catch(e){}
+}
+
 function doGuestLogin(){ alert('訪客模式已停用，請輸入密碼登入'); }
 
 async function doLogin(){
@@ -3310,6 +3349,7 @@ async function doLogin(){
     currentUser=user;
     sessionStorage.setItem(SESSION_KEY, JSON.stringify(user));
     await showApp(user);
+    checkRunStatus();
   }catch(e){ errEl.textContent=e.message; errEl.style.display='block'; }
   finally{ btn.textContent='登入'; btn.disabled=false; }
 }
