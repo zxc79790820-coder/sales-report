@@ -3861,18 +3861,41 @@ const CAP = (() => {
   function renderPersonTab(rows,wdays,from,to){
     const baseAvail=(wdays||1)*480;
 
-    // 從 allLeave 建立每人請假分鐘 map（僅含區間內且非作廢）
-    const leaveMap={};
+    // 每人請假/加班分鐘 map（區間內；排除 作廢/退回/取消；跨日假單按日平均分攤）
+    const EXCLUDE_ST=new Set(['作廢','退回','取消']);
+    const leaveMap={}, otMap={};
     if(typeof allLeave!=='undefined'){
       allLeave.forEach(r=>{
-        if(r.row[0]==='作廢') return;
-        const d=(r.row[9]||'').replace(/\//g,'-');
-        if(d<from||d>to) return;
+        if(EXCLUDE_ST.has(r.row[0])) return;
+        const sd=(r.row[9]||'').replace(/\//g,'-');
+        const ed=((r.row[11]||'').replace(/\//g,'-'))||sd;
         const name=(r.row[2]||'').trim();
-        leaveMap[name]=(leaveMap[name]||0)+(parseFloat(r.row[13])||0)*60;
+        const totalMin=(parseFloat(r.row[13])||0)*60;
+        if(!sd||!totalMin) return;
+        const days=[];
+        let cur=new Date(sd+'T00:00:00Z'), end=new Date(ed+'T00:00:00Z');
+        if(isNaN(cur)||isNaN(end)||end<cur){ days.push(sd); }
+        else{
+          while(cur<=end && days.length<31){
+            days.push(cur.toISOString().slice(0,10));
+            cur.setUTCDate(cur.getUTCDate()+1);
+          }
+        }
+        const per=totalMin/days.length;
+        days.forEach(d=>{ if(d>=from&&d<=to) leaveMap[name]=(leaveMap[name]||0)+per; });
       });
     }
-    function personAvail(name){ return Math.max(60, baseAvail-(leaveMap[name]||0)); }
+    if(typeof allOvertime!=='undefined'){
+      allOvertime.forEach(r=>{
+        if(EXCLUDE_ST.has(r.row[0])) return;
+        const d=(r.row[10]||'').replace(/\//g,'-');
+        if(d<from||d>to) return;
+        const name=(r.row[3]||'').trim();
+        otMap[name]=(otMap[name]||0)+(parseFloat(r.row[16])||0)*60;
+      });
+    }
+    // 可用工時 = 基本工時 − 請假 ＋ 加班
+    function personAvail(name){ return Math.max(60, baseAvail-(leaveMap[name]||0)+(otMap[name]||0)); }
 
     const data={};
     const MERGE_LABEL='裁切・後製・包裝';
@@ -3920,7 +3943,8 @@ const CAP = (() => {
           tr.appendChild(td);
         }
         const avg=(val,d=1)=>wdays?`<div style="font-size:10px;color:var(--text3);margin-top:1px">日均 ${(val/wdays).toLocaleString('zh-TW',{maximumFractionDigits:d})}</div>`:'';
-        tr.innerHTML+=`<td>${person}${leaveMins?` <span style="font-size:10px;color:var(--yellow)">請假${(leaveMins/60).toFixed(1)}H</span>`:''}</td>
+        const otMins=otMap[person]||0;
+        tr.innerHTML+=`<td>${person}${leaveMins?` <span style="font-size:10px;color:var(--yellow)">請假${(leaveMins/60).toFixed(1)}H</span>`:''}${otMins?` <span style="font-size:10px;color:var(--green)">加班${(otMins/60).toFixed(1)}H</span>`:''}</td>
           <td class="num">${fmt(v.才數)}${avg(v.才數)}</td>
           <td class="num">${fmt(v.件數,0)}${avg(v.件數,1)}</td>
           <td class="num">${fmt(v.底數,0)}${avg(v.底數,1)}</td>
