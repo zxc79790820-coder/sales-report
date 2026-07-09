@@ -1067,7 +1067,10 @@ const ITEM_CATEGORY_MAP = {
   "CJDA":"瓦楞紙板","CJDB":"瓦楞紙板",
   "CLI":"壓克力","GDA":"壓克力",
   "GDB":"中空板",
-  "EEA":"卡典"
+  "EEA":"卡典","EDA":"卡典","EDB":"卡典","EAA":"卡典","EAB":"卡典","EBA":"卡典","ECA":"卡典",
+  "AEFC":"阻光帆布","GCB":"雙透布",
+  "CCGA":"10mm發泡板","CCHA":"5mm發泡板",
+  "NCA":"雙面膠帶","VEF":"1mm PVC磁膠","DAB":"背膠磁鐵"
 };
 
 const GROUPS = {
@@ -2207,12 +2210,12 @@ function renderMaterial(){
   // 彙總函數
   function aggregateByCategory(yr){
     // 加工費類代碼：使用者確認不計入材料統計
-    const MATERIAL_EXCLUDE = new Set(['IBA','IBB','IBF','IBH','IBI','ICK','ICV','IDB','IDF','IDP','HBA','HBB','HBC']);
+    const MATERIAL_EXCLUDE = new Set(['IBA','IBB','IBF','IBH','IBI','ICK','ICV','IDB','IDF','IDP','HBA','HBB','HBC','HBD','HBE','IDO']);
     const orders = allOrders.filter(o=> o.date && o.date.startsWith(yr) && o.sqft > 0
       && !(!o.category && MATERIAL_EXCLUDE.has(o.itemCode)));
     const byCat = {};
     orders.forEach(o=>{
-      const cat = o.category || '❓未分類';
+      const cat = o.category || ITEM_CATEGORY_MAP[o.itemCode] || '❓未分類';
       const month = parseInt(o.date.slice(5,7));
       if(!byCat[cat]){ byCat[cat]={total:0}; for(let m=1;m<=12;m++) byCat[cat][m]=0; }
       byCat[cat][month] += o.sqft;
