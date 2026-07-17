@@ -1552,7 +1552,7 @@ function renderDashboard(from,to){
       );
   }
   renderDashLeaveOvertime(from, to);
-  renderWeeklyTracker(refDate);
+  renderWeeklyTracker(refDate, from, to);
 
   // ── 客戶排行（右側）──
   const clientMap={};
@@ -1591,9 +1591,20 @@ function renderDashboard(from,to){
   }
 }
 
-function renderWeeklyTracker(refDate){
+function renderWeeklyTracker(refDate, from, to){
   const el=document.getElementById('weeklyTracker');
   if(!el) return;
+  // 只在查詢區間為「完整一個月」時顯示（1日～該月最後一天）
+  function isFullMonth(f,t){
+    if(!f||!t) return false;
+    const fp=f.split('-').map(Number), tp=t.split('-').map(Number);
+    if(fp.length<3||tp.length<3) return false;
+    if(fp[0]!==tp[0]||fp[1]!==tp[1]) return false;
+    if(fp[2]!==1) return false;
+    return tp[2]===new Date(Date.UTC(fp[0],fp[1],0)).getUTCDate();
+  }
+  if(!isFullMonth(from,to)){ el.style.display='none'; return; }
+  el.style.display='';
   const THRESHOLDS=[
     {w:1,label:'W1',days:'1～7日',   end:7,  target:1500000,hint:'步調正常'},
     {w:2,label:'W2',days:'累計～14日',end:14, target:3100000,hint:'達標機率高'},
