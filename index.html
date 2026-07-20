@@ -3024,6 +3024,22 @@ function getGHConfig(){
 }
 
 // ── GitHub Sync ──
+async function putWithRetry(url, headers, body, tries=4){
+  let lastErr;
+  for(let i=0;i<tries;i++){
+    try{
+      const res = await fetch(url,{method:'PUT',headers,body});
+      if(res.ok) return res;
+      const e = await res.json().catch(()=>({}));
+      lastErr = new Error(e.message||`GitHub API 錯誤（HTTP ${res.status}）`);
+      // 只對「暫時性」錯誤重試：5xx 或 502/503/504
+      if(res.status<500){ throw lastErr; }
+    }catch(err){ lastErr = err; }
+    if(i<tries-1) await new Promise(r=>setTimeout(r, 1500*(i+1)));
+  }
+  throw lastErr;
+}
+
 async function syncToGitHub(){
   const {user,repo,token} = getGHConfig();
   if(!user||!repo||!token){ toast('⚠ 請先到「雲端設定」填入 GitHub 資訊'); openSettings(); return; }
@@ -3044,7 +3060,8 @@ async function syncToGitHub(){
       leave,
       overtime
     };
-    const bodyB64 = btoa(unescape(encodeURIComponent(JSON.stringify(payload, null, 2))));
+    // compact JSON（不縮排，大檔案可省 30~40% 體積，減少大檔案 PUT 失敗機率）
+    const bodyB64 = btoa(unescape(encodeURIComponent(JSON.stringify(payload))));
 
     // check if file exists (get SHA)
     let sha = null;
@@ -3053,15 +3070,12 @@ async function syncToGitHub(){
     });
     if(checkRes.ok){ const j=await checkRes.json(); sha=j.sha; }
 
-    // put file
+    // put file（大檔案偶發 5xx，內建重試）
     const body = { message:`sync: ${new Date().toISOString().slice(0,16).replace('T',' ')}`, content: bodyB64 };
     if(sha) body.sha = sha;
-    const putRes = await fetch(`https://api.github.com/repos/${user}/${repo}/contents/data.json`,{
-      method:'PUT',
-      headers:{ Authorization:`token ${token}`, 'Content-Type':'application/json', Accept:'application/vnd.github.v3+json' },
-      body: JSON.stringify(body)
-    });
-    if(!putRes.ok){ const e=await putRes.json(); throw new Error(e.message||'GitHub API 錯誤'); }
+    await putWithRetry(`https://api.github.com/repos/${user}/${repo}/contents/data.json`,
+      { Authorization:`token ${token}`, 'Content-Type':'application/json', Accept:'application/vnd.github.v3+json' },
+      JSON.stringify(body));
 
     // ── 同步產能報表 (cap_data.json) ──
     const capStore = CAP.loadStore();
@@ -3075,12 +3089,11 @@ async function syncToGitHub(){
       if(capCheck.ok){ const j=await capCheck.json(); capSha=j.sha; }
       const capBody = { message:`cap-sync: ${new Date().toISOString().slice(0,16).replace('T',' ')}`, content: capB64 };
       if(capSha) capBody.sha = capSha;
-      const capPut = await fetch(`https://api.github.com/repos/${user}/${repo}/contents/cap_data.json`,{
-        method:'PUT',
-        headers:{ Authorization:`token ${token}`, 'Content-Type':'application/json', Accept:'application/vnd.github.v3+json' },
-        body: JSON.stringify(capBody)
-      });
-      if(!capPut.ok){ const e=await capPut.json(); console.warn('cap_data.json 同步失敗：'+e.message); }
+      try{
+        await putWithRetry(`https://api.github.com/repos/${user}/${repo}/contents/cap_data.json`,
+          { Authorization:`token ${token}`, 'Content-Type':'application/json', Accept:'application/vnd.github.v3+json' },
+          JSON.stringify(capBody));
+      }catch(e){ console.warn('cap_data.json 同步失敗：'+e.message); }
     }
 
     const capDays = Object.keys(capStore).length;
