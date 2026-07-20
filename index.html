@@ -3050,51 +3050,71 @@ async function syncToGitHub(){
   const btn = document.getElementById('btnSyncUp');
   btn.textContent='⏳ 同步中…'; btn.disabled=true;
 
+  const apiBase = `https://api.github.com/repos/${user}/${repo}/contents`;
+  const getHeaders = { Authorization:`token ${token}`, Accept:'application/vnd.github.v3+json' };
+  const putHeaders = { Authorization:`token ${token}`, 'Content-Type':'application/json', Accept:'application/vnd.github.v3+json' };
+
+  async function getSha(path){
+    try{
+      const r = await fetch(`${apiBase}/${path}`,{headers:getHeaders});
+      if(!r.ok) return null;
+      return (await r.json()).sha || null;
+    }catch(e){ return null; }
+  }
+  async function putYearFile(path, obj, msg){
+    const b64 = btoa(unescape(encodeURIComponent(JSON.stringify(obj))));
+    const sha = await getSha(path);
+    const body = { message: msg, content: b64 };
+    if(sha) body.sha = sha;
+    await putWithRetry(`${apiBase}/${path}`, putHeaders, JSON.stringify(body));
+  }
+
   try {
     const leave = await dbGetAllFrom('leave');
     const overtime = await dbGetAllFrom('overtime');
-    const payload = {
-      version:2,
-      syncedAt: new Date().toISOString(),
-      orders,
-      leave,
-      overtime
-    };
-    // compact JSON（不縮排，大檔案可省 30~40% 體積，減少大檔案 PUT 失敗機率）
-    const bodyB64 = btoa(unescape(encodeURIComponent(JSON.stringify(payload))));
-
-    // check if file exists (get SHA)
-    let sha = null;
-    const checkRes = await fetch(`https://api.github.com/repos/${user}/${repo}/contents/data.json`,{
-      headers:{ Authorization:`token ${token}`, Accept:'application/vnd.github.v3+json' }
-    });
-    if(checkRes.ok){ const j=await checkRes.json(); sha=j.sha; }
-
-    // put file（大檔案偶發 5xx，內建重試）
-    const body = { message:`sync: ${new Date().toISOString().slice(0,16).replace('T',' ')}`, content: bodyB64 };
-    if(sha) body.sha = sha;
-    await putWithRetry(`https://api.github.com/repos/${user}/${repo}/contents/data.json`,
-      { Authorization:`token ${token}`, 'Content-Type':'application/json', Accept:'application/vnd.github.v3+json' },
-      JSON.stringify(body));
-
-    // ── 同步產能報表 (cap_data.json) ──
     const capStore = CAP.loadStore();
-    if(Object.keys(capStore).length){
-      const capPayload = { version:1, syncedAt: new Date().toISOString(), store: capStore };
-      const capB64 = btoa(unescape(encodeURIComponent(JSON.stringify(capPayload))));
-      let capSha = null;
-      const capCheck = await fetch(`https://api.github.com/repos/${user}/${repo}/contents/cap_data.json`,{
-        headers:{ Authorization:`token ${token}`, Accept:'application/vnd.github.v3+json' }
-      });
-      if(capCheck.ok){ const j=await capCheck.json(); capSha=j.sha; }
-      const capBody = { message:`cap-sync: ${new Date().toISOString().slice(0,16).replace('T',' ')}`, content: capB64 };
-      if(capSha) capBody.sha = capSha;
-      try{
-        await putWithRetry(`https://api.github.com/repos/${user}/${repo}/contents/cap_data.json`,
-          { Authorization:`token ${token}`, 'Content-Type':'application/json', Accept:'application/vnd.github.v3+json' },
-          JSON.stringify(capBody));
-      }catch(e){ console.warn('cap_data.json 同步失敗：'+e.message); }
+    const nowIso = new Date().toISOString();
+    const tsLabel = nowIso.slice(0,16).replace('T',' ');
+
+    // ── 依年份分組（訂單/請假/加班）──
+    const byYearOrders={}, byYearLeave={}, byYearOt={};
+    let droppedLeave=0, droppedOt=0;
+    orders.forEach(o=>{ const y=srYearOfOrder(o); if(y) (byYearOrders[y]=byYearOrders[y]||[]).push(o); });
+    leave.forEach(r=>{ const y=srYearOfLeave(r); if(y) (byYearLeave[y]=byYearLeave[y]||[]).push(r); else droppedLeave++; });
+    overtime.forEach(r=>{ const y=srYearOfOt(r); if(y) (byYearOt[y]=byYearOt[y]||[]).push(r); else droppedOt++; });
+    if(droppedLeave||droppedOt) console.warn(`同步略過結構異常記錄：請假 ${droppedLeave} 筆、加班 ${droppedOt} 筆`);
+
+    const allYears = Array.from(new Set([...Object.keys(byYearOrders),...Object.keys(byYearLeave),...Object.keys(byYearOt)])).sort();
+    const manifest = { version:1, updatedAt: nowIso, years:{}, capYears:{} };
+
+    // ── 逐年比對雜湊，只上傳有變動的年份 ──
+    for(const y of allYears){
+      const yObj = { version:3, syncedAt: nowIso, orders:byYearOrders[y]||[], leave:byYearLeave[y]||[], overtime:byYearOt[y]||[] };
+      const hash = await srSha16({orders:yObj.orders, leave:yObj.leave, overtime:yObj.overtime}); // 雜湊不含 syncedAt，避免每次都判定為變動
+      manifest.years[y] = { hash, orders:yObj.orders.length, leave:yObj.leave.length, overtime:yObj.overtime.length };
+      const cacheKey = 'sr_up_dyear_'+y;
+      if(localStorage.getItem(cacheKey) === hash) continue; // 未變動，跳過上傳
+      await putYearFile(`data-${y}.json`, yObj, `sync: data-${y} ${tsLabel}`);
+      localStorage.setItem(cacheKey, hash);
     }
+
+    // ── 產能報表依年份分組，同樣邏輯 ──
+    const byYearCap={};
+    Object.keys(capStore).forEach(d=>{ const y=d.slice(0,4); (byYearCap[y]=byYearCap[y]||{})[d]=capStore[d]; });
+    for(const y of Object.keys(byYearCap)){
+      const cObj = { version:2, syncedAt: nowIso, store: byYearCap[y] };
+      const hash = await srSha16({store:cObj.store}); // 雜湊不含 syncedAt
+      manifest.capYears[y] = { hash, days: Object.keys(cObj.store).length };
+      const cacheKey = 'sr_up_cyear_'+y;
+      if(localStorage.getItem(cacheKey) === hash) continue;
+      try{
+        await putYearFile(`cap-${y}.json`, cObj, `cap-sync: cap-${y} ${tsLabel}`);
+        localStorage.setItem(cacheKey, hash);
+      }catch(e){ console.warn(`cap-${y}.json 同步失敗：`+e.message); }
+    }
+
+    // manifest 永遠重傳（小檔案，提供可靠的「最後同步嘗試」時間戳供告警使用）
+    await putYearFile('manifest.json', manifest, `sync: manifest ${tsLabel}`);
 
     const capDays = Object.keys(capStore).length;
     toast(`✓ 同步完成！訂單 ${orders.length} 筆、請假 ${leave.length} 筆、加班 ${overtime.length} 筆${capDays?'、產能 '+capDays+' 天':''}`);
@@ -3102,79 +3122,115 @@ async function syncToGitHub(){
   finally{ btn.textContent='☁️ 同步到雲端'; btn.disabled=false; }
 }
 
-// ── Auto-load from GitHub on page open (for read-only devices) ──
+// ── 年份分組工具（同步/讀取共用）──
+const SR_DATE_RE = /^\d{4}[/-]\d{1,2}[/-]\d{1,2}$/;
+function srYearOfOrder(o){ return (o.date||'').slice(0,4); }
+function srYearOfLeave(r){ const v=String((r.row||[])[9]||''); return SR_DATE_RE.test(v)?v.slice(0,4):null; }
+function srYearOfOt(r){ const v=String((r.row||[])[10]||''); return SR_DATE_RE.test(v)?v.slice(0,4):null; }
+async function srSha16(obj){
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(JSON.stringify(obj)));
+  return Array.from(new Uint8Array(buf)).map(b=>b.toString(16).padStart(2,'0')).join('').slice(0,16);
+}
+
+// ── Auto-load from GitHub on page open：首次全載，之後每次開頁只比對 manifest 逐年雜湊，只抓有變動的年份 ──
 async function tryAutoLoadFromGitHub(){
-  const user = localStorage.getItem('gh_user')||'zxc79790820-coder';
-  const repo = localStorage.getItem('gh_repo')||'sales-report-data';
+  const {user,repo,token} = getGHConfig();
   if(!user||!repo) return;
   const cnt = await dbCount();
-  let latestSha='';
   try{
-    const cr=await fetch(`https://api.github.com/repos/${user}/${repo}/commits?path=data.json&per_page=1`,{headers:ghHeaders()});
-    if(cr.ok){ latestSha=((await cr.json())[0]||{}).sha||''; }
-  }catch(e){}
-  if(cnt>0 && latestSha && latestSha===localStorage.getItem('sr_data_sha')) return;
-  if(cnt>0 && !latestSha) return;
-  try{
-    loading(true,'從雲端載入資料…');
-    const url=`https://api.github.com/repos/${user}/${repo}/contents/data.json?ref=main&t=${Date.now()}`;
-    const res=await fetch(url,{headers:ghHeaders()});
-    if(!res.ok){ console.log('fetch failed:',res.status); return; }
-    const payload=await res.json();
-    if(!payload.orders||!payload.orders.length) return;
-    const total=payload.orders.length;
-    const batchSize=500;
-    for(let i=0;i<total;i+=batchSize){
-      await dbPutMany(payload.orders.slice(i,i+batchSize));
-      loading(true,`載入中… ${Math.min(i+batchSize,total)} / ${total}`);
+    const headers = token ? {Authorization:`token ${token}`, Accept:'application/vnd.github.raw'} : {Accept:'application/vnd.github.raw'};
+    const apiBase = `https://api.github.com/repos/${user}/${repo}/contents`;
+    const manRes = await fetch(`${apiBase}/manifest.json?ref=main&t=${Date.now()}`,{headers});
+    if(!manRes.ok){ return; }
+    const manifest = await manRes.json();
+    const years = Object.keys(manifest.years||{});
+    if(!years.length) return;
+
+    const changedYears = years.filter(y => cnt===0 || localStorage.getItem('sr_dl_dyear_'+y) !== manifest.years[y].hash);
+    const capYears = Object.keys(manifest.capYears||{});
+    const changedCapYears = capYears.filter(y => cnt===0 || localStorage.getItem('sr_dl_cyear_'+y) !== manifest.capYears[y].hash);
+    if(!changedYears.length && !changedCapYears.length) return;
+
+    loading(true, cnt>0?'偵測到雲端資料更新，同步中…':'從雲端載入資料…');
+    let mergedOrders=[], mergedLeave=[], mergedOvertime=[];
+    for(const y of changedYears){
+      const r = await fetch(`${apiBase}/data-${y}.json?ref=main&t=${Date.now()}`,{headers});
+      if(!r.ok) continue;
+      const p = await r.json();
+      if(p.orders) mergedOrders = mergedOrders.concat(p.orders);
+      if(p.leave) mergedLeave = mergedLeave.concat(p.leave);
+      if(p.overtime) mergedOvertime = mergedOvertime.concat(p.overtime);
+      localStorage.setItem('sr_dl_dyear_'+y, manifest.years[y].hash);
     }
+
+    if(mergedOrders.length){
+      const total=mergedOrders.length, batchSize=500;
+      for(let i=0;i<total;i+=batchSize){
+        await dbPutMany(mergedOrders.slice(i,i+batchSize));
+        loading(true,`載入中… ${Math.min(i+batchSize,total)} / ${total}`);
+      }
+    }
+    if(mergedLeave.length) await dbStore('leave',mergedLeave);
+    if(mergedOvertime.length) await dbStore('overtime',mergedOvertime);
     allOrders=await dbGetAll();
-    // 同步請假和加班資料
-    if(payload.leave&&payload.leave.length){
-      await dbStore('leave',payload.leave);
-    }
-    if(payload.overtime&&payload.overtime.length){
-      await dbStore('overtime',payload.overtime);
-    }
     allLeave=await dbGetAllFrom('leave');
     allOvertime=await dbGetAllFrom('overtime');
     updateDBInfo(); populateTrendSel();
     initLeaveSelects(); initOvertimeSelects();
-    // ── 載入產能報表 ──
-    try{
-      const capUrl=`https://api.github.com/repos/${user}/${repo}/contents/cap_data.json?ref=main&t=${Date.now()}`;
-      const capRes=await fetch(capUrl,{headers:ghHeaders()});
-      if(capRes.ok){
-        const capPayload=await capRes.json();
-        if(capPayload.store && Object.keys(capPayload.store).length){
-          CAP.saveStore(capPayload.store);
+
+    if(changedCapYears.length){
+      try{
+        const existingCap = CAP.loadStore();
+        let mergedCap = {};
+        for(const y of changedCapYears){
+          const cr = await fetch(`${apiBase}/cap-${y}.json?ref=main&t=${Date.now()}`,{headers});
+          if(!cr.ok) continue;
+          const cp = await cr.json();
+          if(cp.store) Object.assign(mergedCap, cp.store);
+          localStorage.setItem('sr_dl_cyear_'+y, manifest.capYears[y].hash);
+        }
+        if(Object.keys(mergedCap).length){
+          CAP.saveStore(Object.assign({}, existingCap, mergedCap));
           CAP.updateStoreInfo();
         }
-      }
-    }catch(e){ console.log('cap_data load skipped:',e); }
-    if(latestSha)localStorage.setItem('sr_data_sha',latestSha);
-    toast(`✓ 已從雲端載入：訂單 ${allOrders.length} 筆、請假 ${allLeave.length} 筆、加班 ${allOvertime.length} 筆`);
-    switchView('dashboard',document.querySelector('[data-view="dashboard"]'));
+      }catch(e){ console.log('cap load skipped:',e); }
+    }
+
+    toast(cnt>0 ? `✓ 已同步雲端最新資料（訂單 ${allOrders.length} 筆）` : `✓ 已從雲端載入：訂單 ${allOrders.length} 筆、請假 ${allLeave.length} 筆、加班 ${allOvertime.length} 筆`);
+    if(cnt===0) switchView('dashboard',document.querySelector('[data-view="dashboard"]'));
   } catch(e){ console.log('auto-load failed:',e); }
   finally{ loading(false); }
 }
 
-// ── Force load from GitHub (覆蓋本機) ──
+// ── Force load from GitHub (無視快取，全量覆蓋本機) ──
 async function forceLoadFromGitHub(){
-  const user = localStorage.getItem('gh_user')||'zxc79790820-coder';
-  const repo = localStorage.getItem('gh_repo')||'sales-report-data';
+  const {user,repo,token} = getGHConfig();
   if(!confirm('確定要從雲端強制更新嗎？本機所有資料將被雲端資料完全覆蓋。')) return;
 
   loading(true,'連線中…');
   try{
     if(!db) await openDB();
-    const url=`https://api.github.com/repos/${user}/${repo}/contents/data.json?ref=main&t=${Date.now()}`;
-    const res=await fetch(url,{headers:ghHeaders()});
-    if(!res.ok) throw new Error(`無法取得資料（${res.status}）`);
+    const headers = token ? {Authorization:`token ${token}`, Accept:'application/vnd.github.raw'} : {Accept:'application/vnd.github.raw'};
+    const apiBase = `https://api.github.com/repos/${user}/${repo}/contents`;
 
-    loading(true,'解析資料中…');
-    const payload=await res.json();
-    if(!payload.orders||!payload.orders.length) throw new Error('雲端資料是空的');
+    const manRes = await fetch(`${apiBase}/manifest.json?ref=main&t=${Date.now()}`,{headers});
+    if(!manRes.ok) throw new Error(`無法取得 manifest（${manRes.status}）`);
+    const manifest = await manRes.json();
+    const years = Object.keys(manifest.years||{});
+    if(!years.length) throw new Error('雲端沒有可用的年份資料');
+
+    loading(true,'下載雲端資料中…');
+    let mergedOrders=[], mergedLeave=[], mergedOvertime=[];
+    for(const y of years){
+      const r = await fetch(`${apiBase}/data-${y}.json?ref=main&t=${Date.now()}`,{headers});
+      if(!r.ok) throw new Error(`data-${y}.json 下載失敗（${r.status}）`);
+      const p = await r.json();
+      if(p.orders) mergedOrders = mergedOrders.concat(p.orders);
+      if(p.leave) mergedLeave = mergedLeave.concat(p.leave);
+      if(p.overtime) mergedOvertime = mergedOvertime.concat(p.overtime);
+      localStorage.setItem('sr_dl_dyear_'+y, manifest.years[y].hash);
+    }
+    if(!mergedOrders.length) throw new Error('雲端資料是空的');
 
     // 清除所有本機資料
     loading(true,'清除舊資料…');
@@ -3183,23 +3239,23 @@ async function forceLoadFromGitHub(){
     await dbClearStore('overtime');
 
     // 寫入訂單
-    const total=payload.orders.length;
+    const total=mergedOrders.length;
     const batchSize=500;
     for(let i=0;i<total;i+=batchSize){
-      await dbPutMany(payload.orders.slice(i,i+batchSize));
+      await dbPutMany(mergedOrders.slice(i,i+batchSize));
       loading(true,`寫入訂單… ${Math.min(i+batchSize,total)} / ${total}`);
     }
 
     // 寫入請假
-    if(payload.leave&&payload.leave.length){
-      loading(true,`寫入請假資料… ${payload.leave.length} 筆`);
-      await dbStore('leave', payload.leave);
+    if(mergedLeave.length){
+      loading(true,`寫入請假資料… ${mergedLeave.length} 筆`);
+      await dbStore('leave', mergedLeave);
     }
 
     // 寫入加班
-    if(payload.overtime&&payload.overtime.length){
-      loading(true,`寫入加班資料… ${payload.overtime.length} 筆`);
-      await dbStore('overtime', payload.overtime);
+    if(mergedOvertime.length){
+      loading(true,`寫入加班資料… ${mergedOvertime.length} 筆`);
+      await dbStore('overtime', mergedOvertime);
     }
 
     allOrders=await dbGetAll();
@@ -3207,18 +3263,19 @@ async function forceLoadFromGitHub(){
     allOvertime=await dbGetAllFrom('overtime');
     updateDBInfo(); populateTrendSel();
     initLeaveSelects(); initOvertimeSelects();
-    // ── 載入產能報表 ──
+    // ── 載入產能報表（各年份合併後一次寫入）──
     try{
-      const capUrl=`https://api.github.com/repos/${user}/${repo}/contents/cap_data.json?ref=main&t=${Date.now()}`;
-      const capRes=await fetch(capUrl,{headers:ghHeaders()});
-      if(capRes.ok){
-        const capPayload=await capRes.json();
-        if(capPayload.store && Object.keys(capPayload.store).length){
-          CAP.saveStore(capPayload.store);
-          CAP.updateStoreInfo();
-        }
+      const capYears = Object.keys(manifest.capYears||{});
+      let mergedCap = {};
+      for(const y of capYears){
+        const cr = await fetch(`${apiBase}/cap-${y}.json?ref=main&t=${Date.now()}`,{headers});
+        if(!cr.ok) continue;
+        const cp = await cr.json();
+        if(cp.store) Object.assign(mergedCap, cp.store);
+        localStorage.setItem('sr_dl_cyear_'+y, manifest.capYears[y].hash);
       }
-    }catch(e){ console.log('cap_data load skipped:',e); }
+      CAP.saveStore(mergedCap); CAP.updateStoreInfo();
+    }catch(e){ console.log('cap load skipped:',e); }
     toast(`✓ 強制更新完成！訂單 ${allOrders.length} 筆、請假 ${allLeave.length} 筆、加班 ${allOvertime.length} 筆`);
     applyDateRange();
     switchView('dashboard',document.querySelector('[data-view="dashboard"]'));
@@ -3344,7 +3401,7 @@ async function checkRunStatus(){
       }
     }catch(e){}
     try{
-      const cr=await fetch(`https://api.github.com/repos/${user}/${repo}/commits?path=data.json&per_page=1`,{headers:ghHeaders()});
+      const cr=await fetch(`https://api.github.com/repos/${user}/${repo}/commits?path=manifest.json&per_page=1`,{headers:ghHeaders()});
       if(cr.ok){
         const cs=await cr.json();
         const ageH=(Date.now()-new Date(cs[0].commit.committer.date).getTime())/3600000;
@@ -3441,15 +3498,26 @@ function applyGuestMode(){
   if(delBtn) delBtn.style.display='none';
   // 切換到 cap 頁
   switchView('cap', document.querySelector('[data-view="cap"]'));
-  // 若本機無資料，自動從 GitHub 拉 cap_data.json
+  // 若本機無資料，自動從 GitHub 拉各年份 cap-{年}.json（經 manifest.json 取得年份清單）
   const ghUser=localStorage.getItem('gh_user')||'zxc79790820-coder';
   const ghRepo=localStorage.getItem('gh_repo')||'sales-report-data';
   if(ghUser && ghRepo){
     const capStore=CAP.loadStore();
     if(!Object.keys(capStore).length){
-      fetch(`https://api.github.com/repos/${ghUser}/${ghRepo}/contents/cap_data.json?ref=main&t=${Date.now()}`,{headers:ghHeaders()})
+      const gApiBase = `https://api.github.com/repos/${ghUser}/${ghRepo}/contents`;
+      fetch(`${gApiBase}/manifest.json?ref=main&t=${Date.now()}`,{headers:ghHeaders()})
         .then(r=>r.ok?r.json():null)
-        .then(p=>{ if(p?.store&&Object.keys(p.store).length){ CAP.saveStore(p.store); CAP.updateStoreInfo(); } })
+        .then(async manifest=>{
+          if(!manifest?.capYears) return;
+          let merged={};
+          for(const y of Object.keys(manifest.capYears)){
+            const cr = await fetch(`${gApiBase}/cap-${y}.json?ref=main&t=${Date.now()}`,{headers:ghHeaders()});
+            if(!cr.ok) continue;
+            const cp = await cr.json();
+            if(cp.store) Object.assign(merged, cp.store);
+          }
+          if(Object.keys(merged).length){ CAP.saveStore(merged); CAP.updateStoreInfo(); }
+        })
         .catch(()=>{});
     }
   }
