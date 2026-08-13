@@ -3085,7 +3085,7 @@ async function syncToGitHub(){
     if(droppedLeave||droppedOt) console.warn(`同步略過結構異常記錄：請假 ${droppedLeave} 筆、加班 ${droppedOt} 筆`);
 
     const allYears = Array.from(new Set([...Object.keys(byYearOrders),...Object.keys(byYearLeave),...Object.keys(byYearOt)])).sort();
-    const manifest = { version:1, updatedAt: nowIso, years:{}, capYears:{} };
+    const manifest = { version:1, updatedAt: nowIso, years:{}, capYears:{}, capMonths:{} };
 
     // ── 逐年比對雜湊，只上傳有變動的年份 ──
     for(const y of allYears){
@@ -3098,19 +3098,21 @@ async function syncToGitHub(){
       localStorage.setItem(cacheKey, hash);
     }
 
-    // ── 產能報表依年份分組，同樣邏輯 ──
-    const byYearCap={};
-    Object.keys(capStore).forEach(d=>{ const y=d.slice(0,4); (byYearCap[y]=byYearCap[y]||{})[d]=capStore[d]; });
-    for(const y of Object.keys(byYearCap)){
-      const cObj = { version:2, syncedAt: nowIso, store: byYearCap[y] };
+    // ── 產能報表依「月份」分組（cap-YYYY-MM.json）──
+    // 年度單檔會長到數十 MB，每天整包重傳會逼近 GitHub API 上限；改成分月後單檔約 2～6MB。
+    // 上傳與否一律以「內容雜湊」判斷，不是只傳當月：舊月份若被回頭修改，其雜湊會變，同樣會自動重傳。
+    const byMonthCap={};
+    Object.keys(capStore).forEach(d=>{ const m=String(d).slice(0,7); if(m.length===7) (byMonthCap[m]=byMonthCap[m]||{})[d]=capStore[d]; });
+    for(const m of Object.keys(byMonthCap).sort()){
+      const cObj = { version:3, syncedAt: nowIso, month:m, store: byMonthCap[m] };
       const hash = await srSha16({store:cObj.store}); // 雜湊不含 syncedAt
-      manifest.capYears[y] = { hash, days: Object.keys(cObj.store).length };
-      const cacheKey = 'sr_up_cyear_'+y;
+      manifest.capMonths[m] = { hash, days: Object.keys(cObj.store).length };
+      const cacheKey = 'sr_up_cmon_'+m;
       if(localStorage.getItem(cacheKey) === hash) continue;
       try{
-        await putYearFile(`cap-${y}.json`, cObj, `cap-sync: cap-${y} ${tsLabel}`);
+        await putYearFile(`cap-${m}.json`, cObj, `cap-sync: cap-${m} ${tsLabel}`);
         localStorage.setItem(cacheKey, hash);
-      }catch(e){ console.warn(`cap-${y}.json 同步失敗：`+e.message); }
+      }catch(e){ console.warn(`cap-${m}.json 同步失敗：`+e.message); }
     }
 
     // manifest 永遠重傳（小檔案，提供可靠的「最後同步嘗試」時間戳供告警使用）
@@ -3147,9 +3149,12 @@ async function tryAutoLoadFromGitHub(){
     if(!years.length) return;
 
     const changedYears = years.filter(y => cnt===0 || localStorage.getItem('sr_dl_dyear_'+y) !== manifest.years[y].hash);
-    const capYears = Object.keys(manifest.capYears||{});
-    const changedCapYears = capYears.filter(y => cnt===0 || localStorage.getItem('sr_dl_cyear_'+y) !== manifest.capYears[y].hash);
-    if(!changedYears.length && !changedCapYears.length) return;
+    // 產能：優先讀月份檔（cap-YYYY-MM.json）；舊 manifest 沒有 capMonths 時自動回退到年度檔
+    const capIsMonthly = Object.keys(manifest.capMonths||{}).length > 0;
+    const capMeta      = capIsMonthly ? manifest.capMonths : (manifest.capYears||{});
+    const capPrefix    = capIsMonthly ? 'sr_dl_cmon_' : 'sr_dl_cyear_';
+    const changedCapKeys = Object.keys(capMeta).filter(k => cnt===0 || localStorage.getItem(capPrefix+k) !== capMeta[k].hash);
+    if(!changedYears.length && !changedCapKeys.length) return;
 
     loading(true, cnt>0?'偵測到雲端資料更新，同步中…':'從雲端載入資料…');
     let mergedOrders=[], mergedLeave=[], mergedOvertime=[];
@@ -3178,16 +3183,16 @@ async function tryAutoLoadFromGitHub(){
     updateDBInfo(); populateTrendSel();
     initLeaveSelects(); initOvertimeSelects();
 
-    if(changedCapYears.length){
+    if(changedCapKeys.length){
       try{
         const existingCap = CAP.loadStore();
         let mergedCap = {};
-        for(const y of changedCapYears){
-          const cr = await fetch(`${apiBase}/cap-${y}.json?ref=main&t=${Date.now()}`,{headers});
+        for(const k of changedCapKeys){
+          const cr = await fetch(`${apiBase}/cap-${k}.json?ref=main&t=${Date.now()}`,{headers});
           if(!cr.ok) continue;
           const cp = await cr.json();
           if(cp.store) Object.assign(mergedCap, cp.store);
-          localStorage.setItem('sr_dl_cyear_'+y, manifest.capYears[y].hash);
+          localStorage.setItem(capPrefix+k, capMeta[k].hash);
         }
         if(Object.keys(mergedCap).length){
           CAP.saveStore(Object.assign({}, existingCap, mergedCap));
@@ -3265,14 +3270,17 @@ async function forceLoadFromGitHub(){
     initLeaveSelects(); initOvertimeSelects();
     // ── 載入產能報表（各年份合併後一次寫入）──
     try{
-      const capYears = Object.keys(manifest.capYears||{});
+      // 優先讀月份檔（cap-YYYY-MM.json），舊 manifest 才回退年度檔
+      const capIsMonthly = Object.keys(manifest.capMonths||{}).length > 0;
+      const capMeta      = capIsMonthly ? manifest.capMonths : (manifest.capYears||{});
+      const capPrefix    = capIsMonthly ? 'sr_dl_cmon_' : 'sr_dl_cyear_';
       let mergedCap = {};
-      for(const y of capYears){
-        const cr = await fetch(`${apiBase}/cap-${y}.json?ref=main&t=${Date.now()}`,{headers});
+      for(const k of Object.keys(capMeta)){
+        const cr = await fetch(`${apiBase}/cap-${k}.json?ref=main&t=${Date.now()}`,{headers});
         if(!cr.ok) continue;
         const cp = await cr.json();
         if(cp.store) Object.assign(mergedCap, cp.store);
-        localStorage.setItem('sr_dl_cyear_'+y, manifest.capYears[y].hash);
+        localStorage.setItem(capPrefix+k, capMeta[k].hash);
       }
       CAP.saveStore(mergedCap); CAP.updateStoreInfo();
     }catch(e){ console.log('cap load skipped:',e); }
@@ -3508,9 +3516,14 @@ function applyGuestMode(){
       fetch(`${gApiBase}/manifest.json?ref=main&t=${Date.now()}`,{headers:ghHeaders()})
         .then(r=>r.ok?r.json():null)
         .then(async manifest=>{
-          if(!manifest?.capYears) return;
+          if(!manifest) return;
+          // 優先讀月份檔（cap-YYYY-MM.json），舊 manifest 才回退年度檔
+          const capKeys = Object.keys(manifest.capMonths||{}).length
+            ? Object.keys(manifest.capMonths)
+            : Object.keys(manifest.capYears||{});
+          if(!capKeys.length) return;
           let merged={};
-          for(const y of Object.keys(manifest.capYears)){
+          for(const y of capKeys){
             const cr = await fetch(`${gApiBase}/cap-${y}.json?ref=main&t=${Date.now()}`,{headers:ghHeaders()});
             if(!cr.ok) continue;
             const cp = await cr.json();
